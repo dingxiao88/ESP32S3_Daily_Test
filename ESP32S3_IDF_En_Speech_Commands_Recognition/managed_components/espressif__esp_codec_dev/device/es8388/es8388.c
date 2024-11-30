@@ -302,7 +302,8 @@ static int es8388_enable(const audio_codec_if_t *h, bool enable)
     }
     if (res == ESP_CODEC_DEV_OK) {
         codec->enabled = enable;
-        ESP_LOGD(TAG, "Codec is %s", enable ? "enabled" : "disabled");
+        // ESP_LOGD(TAG, "Codec is %s", enable ? "enabled" : "disabled");
+        ESP_LOGI(TAG, "Codec is %s", enable ? "enabled" : "disabled");
     }
     return res;
 }
