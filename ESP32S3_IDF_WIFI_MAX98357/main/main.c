@@ -321,9 +321,11 @@ void app_main(void)
 #endif
 
 #if DX_WIFI_MP3
+
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "freertos/queue.h"
 #include "driver/i2s_std.h"
 #include "driver/gpio.h"
@@ -332,19 +334,18 @@ void app_main(void)
 #include "esp_http_client.h"
 #include "nvs_flash.h"
 
-// #include "esp_crt_bundle.h"  // 包含全局 CA 证书的头文件
 
 #define MINIMP3_IMPLEMENTATION
 #include "minimp3.h"
+
+#include "iic.h"
+#include "xl9555.h"
 
 static const char *TAG = "STREAM_PLAYER";
 
 // WiFi配置
 #define WIFI_SSID "wuyiyi2"
 #define WIFI_PASS "dingxiao88"
-#define STREAM_URL1 "http://media-ice.musicradio.com:80/ClassicFMMP3"
-#define STREAM_URL2 "http://music.163.com/song/media/outer/url?id=500665351"
-// #define STREAM_URL "http://music.163.com/song/media/outer/url?id=488641895"
 
 // I2S引脚定义
 #define I2S_BCK_IO      GPIO_NUM_16 
@@ -358,7 +359,8 @@ static const char *TAG = "STREAM_PLAYER";
 #define VOLUME_DEFAULT  1.0f    // 默认音量 (原始音量)
 
 #define SAMPLE_RATE     44100
-#define MP3_BUFFER_SIZE (1024 * 32)  // 32KB buffer
+// #define MP3_BUFFER_SIZE (1024 * 32)  // 32KB buffer
+#define MP3_BUFFER_SIZE (1024 * 10)  // 32KB buffer
 #define PCM_BUFFER_SIZE (1152 * 2)   // PCM buffer size
 #define STREAM_BUFFER_SIZE (1024 * 4) // 4KB for streaming
 
@@ -393,11 +395,23 @@ typedef struct {
 static const int QUEUE_LENGTH = 10;
 static const int QUEUE_ITEM_SIZE = sizeof(stream_cmd_t);
 static QueueHandle_t cmd_queue = NULL;
-static volatile bool cmd_processed = false;  // 添加命令处理标志
-// static char* current_url = NULL;
-char* current_url = NULL;
-static char* current_url2 = "http://music.163.com/song/media/outer/url?id=569213220";//NULL;
-static char* current_url3 = "http://music.163.com/song/media/outer/url?id=394690";//NULL;
+
+static char* current_url = NULL;
+
+#define DX_PLAY_MAX 5
+static char * play_musiclist[DX_PLAY_MAX] = {
+                                "http://media-ice.musicradio.com:80/ClassicFMMP3",
+                                "http://lhttp.qingting.fm/live/339/64k.mp3",
+                                // "http://media-ice.musicradio.com:80/ClassicFM-M-Movies",
+                                // "http://radionorthsea.zapto.org:8008/stream",
+                                "http://music.163.com/song/media/outer/url?id=569213220",
+                                "http://music.163.com/song/media/outer/url?id=500665351",
+                                "http://music.163.com/song/media/outer/url?id=488641895",
+                                // "http://music.163.com/song/media/outer/url?id=394690",
+                                
+
+      };
+static u8_t play_index = 0;
 
 static u8_t play_flag = 0;
 // 添加全局标志
@@ -405,7 +419,17 @@ static volatile bool should_stop_http = false;
 
 static esp_http_client_handle_t client = NULL;  // 全局HTTP客户端句柄
 
-// WiFi事件处理
+float play_volume = 0.2;
+
+
+// I2C 通道句柄
+static i2c_obj_t i2c0_master;
+
+// 定义二进制信号量
+SemaphoreHandle_t binarySemaphore;
+
+
+//@-WiFi事件处理
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                              int32_t event_id, void *event_data)
 {
@@ -420,7 +444,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     }
 }
 
-// WiFi初始化
+//@-WiFi初始化
 static void wifi_init(void)
 {
     ESP_ERROR_CHECK(esp_netif_init());
@@ -444,18 +468,18 @@ static void wifi_init(void)
     ESP_ERROR_CHECK(esp_wifi_start());
 }
 
-// 音量控制函数
+//@-音量控制函数
 void set_volume(float volume) {
-    if (volume < VOLUME_MIN) {
-        volume = VOLUME_MIN;
-    } else if (volume > VOLUME_MAX) {
-        volume = VOLUME_MAX;
-    }
+    // if (volume < VOLUME_MIN) {
+    //     volume = VOLUME_MIN;
+    // } else if (volume > VOLUME_MAX) {
+    //     volume = VOLUME_MAX;
+    // }
     current_volume = volume;
     ESP_LOGI(TAG, "Volume set to %.2f", current_volume);
 }
 
-// 音频数据音量调节函数
+//@-音频数据音量调节函数
 void adjust_volume(int16_t* samples, size_t sample_count) {
     if (current_volume == 1.0f) {
         return; // 原始音量，无需调整
@@ -477,7 +501,7 @@ void adjust_volume(int16_t* samples, size_t sample_count) {
     }
 }
 
-// 初始化I2S
+//@-初始化I2S
 static esp_err_t i2s_init(void)
 {
     // 1. 配置I2S通道
@@ -519,7 +543,7 @@ static esp_err_t i2s_init(void)
     return ESP_OK;
 }
 
-// HTTP事件处理
+//@-HTTP事件处理
 esp_err_t _http_event_handler(esp_http_client_event_t *evt)
 {
     static uint32_t total_bytes = 0;  // 总字节计数
@@ -545,9 +569,9 @@ esp_err_t _http_event_handler(esp_http_client_event_t *evt)
                         ESP_LOGE(TAG, "Queue send failed, freeing buffer");
                         free(data);
                     } 
-                    else {
-                        ESP_LOGI(TAG, "Queued %zu bytes of MP3 data", evt->data_len);
-                    }
+                    // else {
+                    //     ESP_LOGI(TAG, "Queued %zu bytes of MP3 data", evt->data_len);
+                    // }
                 }
             }
             break;
@@ -575,80 +599,45 @@ esp_err_t _http_event_handler(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
-#if 1
-// 流媒体接收任务
+//@-更新 URL 的函数
+void update_current_url(const char *new_url) {
+    if (new_url == NULL) {
+        ESP_LOGE(TAG, "New URL is NULL");
+        return;
+    }
+
+    // 释放旧的 URL
+    if (current_url) {
+        ESP_LOGI(TAG, "Freeing old URL: %s", current_url);
+        free(current_url);
+        current_url = NULL;  // 释放后将指针设置为 NULL
+    }
+
+    // 复制新的 URL
+    current_url = strdup(new_url);
+    if (current_url == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate memory for current_url");
+    } else {
+        ESP_LOGI(TAG, "Updated current_url to: %s", current_url);
+    }
+}
+
+//@-流媒体接收任务
 void stream_task(void *pvParameters)
 {
-    // esp_http_client_handle_t client = NULL;
-
     while (1) {
 
-        // if (is_playing && current_url) {
         if ((is_playing == true)) {
 
-            // if(play_flag == 0)
-            // {
-            //     // 动态更新播放地址
-            //     if (current_url) {
-            //         free(current_url);  // 释放旧的内存
-            //         current_url = NULL;  // 释放后将指针设置为 NULL
-            //     }
-
-            //     current_url = strdup(current_url2);  // 复制新的字符串
-            //     if (current_url == NULL) {
-            //         ESP_LOGE(TAG, "Failed to allocate memory for current_url");
-            //     }
-            // }
-            // else if (play_flag == 1)
-            // {
-            //     // 动态更新播放地址
-            //     if (current_url) {
-            //         free(current_url);  // 释放旧的内存
-            //         current_url = NULL;  // 释放后将指针设置为 NULL
-            //     }
-
-            //     current_url = strdup(current_url3);  // 复制新的字符串
-            //     if (current_url == NULL) {
-            //         ESP_LOGE(TAG, "Failed to allocate memory for current_url");
-            //     }
-            // }
-
-            // esp_http_client_config_t config = {
-            // .url = current_url,
-            // .event_handler = _http_event_handler,
-            // .buffer_size = STREAM_BUFFER_SIZE,
-            // .timeout_ms = 5000,  // 30秒超时
-            // .skip_cert_common_name_check = true,
-            // };
-
-            
-            esp_http_client_config_t config1 = {
-            .url = STREAM_URL1,
+            esp_http_client_config_t config = {
+            .url = current_url,
             .event_handler = _http_event_handler,
             .buffer_size = STREAM_BUFFER_SIZE,
             .timeout_ms = 5000,  // 30秒超时
             .skip_cert_common_name_check = true,
             };
-            esp_http_client_config_t config2 = {
-            .url = STREAM_URL2,
-            .event_handler = _http_event_handler,
-            .buffer_size = STREAM_BUFFER_SIZE,
-            .timeout_ms = 5000,  // 30秒超时
-            .skip_cert_common_name_check = true,
-            };
-
-            // 打印配置的URL
-            // ESP_LOGI(TAG, "HTTP client config URL: %s", config.url);
-            // ESP_LOGI(TAG, "URL length: %d", strlen(config.url));
-
-            // ESP_LOGI(TAG, "Starting stream from %s", STREAM_URL);
-            
-            // esp_http_client_handle_t client = esp_http_client_init(&config);
-            if(play_flag == 0)
-            client = esp_http_client_init(&config1);
-            else if(play_flag == 1)
-            client = esp_http_client_init(&config2);
-
+ 
+            client = esp_http_client_init(&config);
 
             if (client == NULL) {
                 ESP_LOGE(TAG, "Failed to initialize HTTP client");
@@ -662,58 +651,30 @@ void stream_task(void *pvParameters)
             // char* dx_random_str = (char*)malloc(32);
             // sprintf(dx_random_str, "DX Audio Player %d", dx_random_num);
             esp_http_client_set_header(client, "User-Agent", "DX Audio Player");
+            vTaskDelay(pdMS_TO_TICKS(500));
             
             ESP_LOGI(TAG, "esp_http_client_perform... begin");
             // 执行HTTP请求
             esp_err_t err = esp_http_client_perform(client);
 
             ESP_LOGI(TAG, "esp_http_client_perform... end");
-            // 检查HTTP响应
-            // if (err == ESP_OK) {
-            //     int status = esp_http_client_get_status_code(client);
-            //     ESP_LOGI(TAG, "HTTP Stream finished, status = %d", status);
-            // } else {
-            //     ESP_LOGE(TAG, "HTTP Stream failed: %s", esp_err_to_name(err));
-            // }
-
-            // 处理完成后清理
-            esp_http_client_cleanup(client);
-            client = NULL;
-            
-            // // 清理HTTP客户端
-            // if (client) 
-            // {
-            //     ESP_LOGI(TAG, "666--->Close client");
-            //     esp_http_client_close(client);
-
-            //     esp_http_client_cleanup(client);
-            //     client = NULL;
-
-            //     // 清空音频队列
-            //     uint8_t *data;
-            //     while (xQueueReceive(audio_data_queue, &data, 0) == pdTRUE) {
-            //         free(data);
-            //     }
-            // }
             
             // 等待一段时间后重试
             ESP_LOGI(TAG, "1--->Waiting before reconnect...");
-            vTaskDelay(pdMS_TO_TICKS(100));
+            vTaskDelay(pdMS_TO_TICKS(50));
         }
         else
         {            
-            // 等待一段时间后重试
-            // is_playing = true;
+            // 释放信号量
+            xSemaphoreGive(binarySemaphore);
             ESP_LOGI(TAG, "2--->vTaskDelete stream_task");
             vTaskDelay(pdMS_TO_TICKS(1000));
             // vTaskDelete(NULL);
         }
     }
 }
-#endif
 
-#if 1
-// 初始化命令队列
+//@-初始化命令队列
 void init_stream_control(void) {
     cmd_queue = xQueueCreate(QUEUE_LENGTH, QUEUE_ITEM_SIZE);
     if (cmd_queue == NULL) {
@@ -721,7 +682,7 @@ void init_stream_control(void) {
     }
 }
 
-// 更改URL
+//@-更改URL
 esp_err_t change_stream_url(const char* new_url)
 {
     if (!new_url) {
@@ -732,15 +693,7 @@ esp_err_t change_stream_url(const char* new_url)
         .cmd = CMD_CHANGE_URL,
     };
     
-    // 安全地复制URL
-    size_t url_len = strlen(new_url);
-    if (url_len >= sizeof(cmd.data.url_data.url)) {
-        ESP_LOGE(TAG, "URL too long");
-        return ESP_ERR_INVALID_ARG;
-    }
-    
-    cmd.data.url_data.len = url_len;
-    memcpy(cmd.data.url_data.url, new_url, url_len + 1);  // +1 for null terminator
+    update_current_url(new_url);
 
     if (xQueueSend(cmd_queue, &cmd, portMAX_DELAY) != pdTRUE) {
         return ESP_FAIL;
@@ -749,7 +702,7 @@ esp_err_t change_stream_url(const char* new_url)
     return ESP_OK;
 }
 
-// 控制播放状态
+//@-控制播放状态
 esp_err_t control_stream(stream_cmd_type_t cmd_type) {
     stream_cmd_t cmd = {
         .cmd = cmd_type
@@ -757,7 +710,7 @@ esp_err_t control_stream(stream_cmd_type_t cmd_type) {
     
     return (xQueueSend(cmd_queue, &cmd, portMAX_DELAY) == pdTRUE) ? ESP_OK : ESP_FAIL;
 }
-// 调整音量
+//@-调整音量
 esp_err_t set_stream_volume(float volume) {
     stream_cmd_t cmd = {
         .cmd = CMD_VOLUME,
@@ -767,134 +720,11 @@ esp_err_t set_stream_volume(float volume) {
     return (xQueueSend(cmd_queue, &cmd, portMAX_DELAY) == pdTRUE) ? ESP_OK : ESP_FAIL;
 }
 
-#if 0
-// 修改后的流媒体接收任务
-void stream_task(void *pvParameters)
-{
-    stream_cmd_t cmd;
-    esp_http_client_handle_t client = NULL;
-
-    const TickType_t queue_check_period = pdMS_TO_TICKS(500);  // 每100ms检查一次
-
-
-    while (1) {
-
-        ESP_LOGI(TAG, "stream_task run");
-        // 检查是否有新命令
-        if (xQueueReceive(cmd_queue, &cmd, 10) == pdTRUE) {
-
-            ESP_LOGI(TAG, "Received command");
-
-            switch (cmd.cmd) {
-                case CMD_CHANGE_URL:
-                    // 关闭当前连接
-                    if (client) {
-                        esp_http_client_cleanup(client);
-                        client = NULL;
-                    }
-                    // 更新URL
-                    if (current_url) {
-                        free(current_url);
-                    }
-                    current_url = cmd.data.url;
-                    ESP_LOGI(TAG, "URL changed to: %s", current_url);
-                    break;
-
-                case CMD_STOP:
-                    is_playing = false;
-                    if (client) {
-                        esp_http_client_cleanup(client);
-                        client = NULL;
-                    }
-                    ESP_LOGI(TAG, "Streaming stopped");
-                    break;
-
-                case CMD_START:
-                    is_playing = true;
-                    ESP_LOGI(TAG, "Streaming started");
-                    break;
-
-                case CMD_VOLUME:
-                    current_volume = cmd.data.volume;
-                    ESP_LOGI(TAG, "Volume set to: %.2f", current_volume);
-                    break;
-            }
-
-            cmd_processed = true;  // 设置命令处理标志
-            ESP_LOGI(TAG, "Command processed");
-        }
-
-        // 如果没有活动的客户端且正在播放，创建新的连接
-        if (!client && is_playing && current_url) {
-            esp_http_client_config_t config = {
-                .url = current_url,
-                .event_handler = _http_event_handler,
-                .buffer_size = STREAM_BUFFER_SIZE,
-                .timeout_ms = 30000,
-                .skip_cert_common_name_check = true
-            };
-            
-            client = esp_http_client_init(&config);
-            if (client) {
-                esp_http_client_set_header(client, "User-Agent", "ESP32 Audio Player");
-                
-                // 执行HTTP请求
-                esp_err_t err = esp_http_client_perform(client);
-                
-                if (err != ESP_OK) {
-                    ESP_LOGE(TAG, "HTTP Stream failed: %s", esp_err_to_name(err));
-                    esp_http_client_cleanup(client);
-                    client = NULL;
-                    vTaskDelay(pdMS_TO_TICKS(5000));  // 失败后等待5秒
-                }
-            }
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(10));  // 防止任务过度占用CPU
-    }
-}
-#endif
-
-#if 0
-// HTTP流处理任务
-void http_stream_task(void *pvParameters)
-{
-    esp_http_client_handle_t client = NULL;
-
-    while (1) {
-        if (is_playing && current_url) {
-            esp_http_client_config_t config = {
-                .url = current_url,
-                .event_handler = _http_event_handler,
-                .buffer_size = STREAM_BUFFER_SIZE,
-                .timeout_ms = 30000,
-                .skip_cert_common_name_check = true
-            };
-            
-            client = esp_http_client_init(&config);
-            if (client) {
-                esp_http_client_set_header(client, "User-Agent", "ESP32 Audio Player");
-                
-                // 执行HTTP请求（阻塞式）
-                esp_err_t err = esp_http_client_perform(client);
-                
-                if (err != ESP_OK) {
-                    ESP_LOGE(TAG, "HTTP Stream failed: %s", esp_err_to_name(err));
-                }
-
-                esp_http_client_cleanup(client);
-                client = NULL;
-            }
-        }
-        vTaskDelay(pdMS_TO_TICKS(10)); // 等待1秒后重试
-    }
-}
-#endif
-
-
-// 3. 添加安全的HTTP客户端停止函数
+//@-HTTP客户端安全停止函数
 void safe_stop_http_client(void)
 {
+    // ESP_LOGI(TAG, "safe_stop_http_client... begin");
+
     if (client) {
         ESP_LOGI(TAG, "Stopping HTTP client...");
         
@@ -905,39 +735,57 @@ void safe_stop_http_client(void)
         esp_http_client_set_timeout_ms(client, 0);
 
         // 4. 等待一小段时间
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(300));
         
         // 3. 强制关闭连接
-        esp_http_client_close(client);
+        // esp_http_client_close(client);
         
         // 4. 等待一小段时间
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(300));
         
         // 5. 清理资源
         esp_http_client_cleanup(client);
         client = NULL;
-        
-        // 6. 重置标志
-        should_stop_http = false;
-        
+
+        while (1) {
+
+            //@-等待退出
+            if (xSemaphoreTake(binarySemaphore, portMAX_DELAY) == pdTRUE) {
+                break;
+            }
+            else
+            {
+                ESP_LOGI(TAG, "waiting binarySemaphore...");
+                vTaskDelay(pdMS_TO_TICKS(500));  // 执行1秒
+            }
+            
+        }
+
+        // vTaskDelay(pdMS_TO_TICKS(100));
+
         // 7. 清空音频队列
         uint8_t *data;
         while (xQueueReceive(audio_data_queue, &data, 0) == pdTRUE) {
             free(data);
         }
-
+        vTaskDelay(pdMS_TO_TICKS(500));
+        
+        // 6. 重置标志
+        should_stop_http = false;
+        
         // 4. 等待一小段时间
         vTaskDelay(pdMS_TO_TICKS(500));
         
         ESP_LOGI(TAG, "HTTP client stopped successfully");
+
+        // vTaskDelay(pdMS_TO_TICKS(500));
     }
+
 }
 
-// 命令处理任务
+//@-命令处理任务
 void stream_cmd_task(void *pvParameters)
 {
-    static char current_url_buffer[256] = {0};  // 使用静态缓冲区
-    bool url_set = false;
     stream_cmd_t cmd;
 
     while (1) {
@@ -961,6 +809,7 @@ void stream_cmd_task(void *pvParameters)
                 case CMD_CHANGE_URL:
                     is_playing = false;
                     ESP_LOGI(TAG, "Processing URL change command");
+
                     safe_stop_http_client(); 
 
                     // 安全地更新URL
@@ -970,6 +819,8 @@ void stream_cmd_task(void *pvParameters)
                     //     url_set = true;
                     //     ESP_LOGI(TAG, "URL updated to: %s", current_url_buffer);
                     // }
+
+                    // vTaskDelay(pdMS_TO_TICKS(500));
 
                     is_playing = true;
 
@@ -985,9 +836,7 @@ void stream_cmd_task(void *pvParameters)
     }
 }
 
-
-#endif
-
+//@-音频解码播放任务
 void decode_play_task(void *pvParameters)
 {
     mp3dec_t mp3d;
@@ -1122,59 +971,62 @@ cleanup:
     vTaskDelete(NULL);
 }
 
-
-// 监控任务
+//@-监控任务
 void monitor_task(void *pvParameters)
 {
-    vTaskDelay(pdMS_TO_TICKS(10000));  // 每30秒打印一次
-    // ESP_LOGI(TAG, "change task");
-    // esp_err_t ret = control_stream(CMD_STOP);
-    // ESP_LOGI(TAG, "control_stream ret: %s", esp_err_to_name(ret));
-
-    // while (1)
-    // {
-    //     vTaskDelay(pdMS_TO_TICKS(10000));  // 每30秒打印一次
-    // }
-    
 
     while (1) {
 
-        ESP_LOGI(TAG, "is_playing: %d", is_playing);
+        //@-扫描I2C键盘
+        u8_t key = xl9555_key_scan(0);
 
-        if(play_flag == 0)
+        //@-播放
+        if(key == KEY0_PRES)
         {
-            ESP_LOGI(TAG, "change to 1");
-            play_flag = 1;
-            // 停止播放
-            // control_stream(CMD_STOP);
+            play_index = play_index + 1;
+            if(play_index >= DX_PLAY_MAX)
+            play_index = 0;
 
-            change_stream_url("http://music.163.com/song/media/outer/url?id=569213220");
-            
-            // 开始播放
-            // control_stream(CMD_START);
-            // 调整音量
-            // set_stream_volume(0.2f);
+            ESP_LOGI(TAG, "play_index: %d", play_index);
+            change_stream_url(play_musiclist[play_index]);
         }
-        else if(play_flag == 1)
+        else if(key == KEY2_PRES)
         {
-            ESP_LOGI(TAG, "change to 0");
-            play_flag = 0;
-            
-            // 停止播放
-            // control_stream(CMD_STOP);
+            play_index = play_index - 1;
+            if(play_index == 255)
+            play_index = DX_PLAY_MAX;
 
-            change_stream_url("http://music.163.com/song/media/outer/url?id=394690");
-            
-            // 开始播放
-            // control_stream(CMD_START);
-            // 调整音量
-            // set_stream_volume(0.2f);
+            ESP_LOGI(TAG, "play_index: %d", play_index);
+            change_stream_url(play_musiclist[play_index]);
         }
 
-        vTaskDelay(pdMS_TO_TICKS(20000));  // 每30秒打印一次
+        //@-音量+
+        else if(key == KEY3_PRES)
+        {
+            play_volume = play_volume + 0.2;
+            if (play_volume < VOLUME_MIN) {
+                play_volume = VOLUME_MIN;
+            } else if (play_volume > VOLUME_MAX) {
+                play_volume = VOLUME_MAX;
+            }
+            set_volume(play_volume);
+        }
+        else if(key == KEY1_PRES)
+        {
+            play_volume = play_volume - 0.2;
+            if (play_volume < VOLUME_MIN) {
+                play_volume = VOLUME_MIN;
+            } else if (play_volume > VOLUME_MAX) {
+                play_volume = VOLUME_MAX;
+            }
+            set_volume(play_volume);
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(100));  // 每30秒打印一次
     }
 }
 
+//@-主程序
 void app_main(void)
 {
     // 初始化NVS
@@ -1189,23 +1041,38 @@ void app_main(void)
     audio_data_queue = xQueueCreate(32, sizeof(uint8_t*));
     // 初始化命令队列
     init_stream_control();
-    
+
+    // 创建信号量
+    binarySemaphore = xSemaphoreCreateBinary();
+    if (binarySemaphore == NULL) {
+        printf("Failed to create binary semaphore\n");
+    } else {
+        printf("Binary semaphore created successfully\n");
+    }
+
     // 初始化WiFi
     wifi_init();
-    
+
     // 初始化I2S
+    vTaskDelay(pdMS_TO_TICKS(500));
     ESP_ERROR_CHECK(i2s_init());
     ESP_LOGI(TAG, "I2S initialized successfully");
+
+    // 初始化I2C
+    vTaskDelay(pdMS_TO_TICKS(500));
+    i2c0_master = iic_init(I2C_NUM_0);
+    xl9555_init(i2c0_master);
+
     // 设置具体音量值
-    set_volume(0.2f);    // 设置为50%音量
+    set_volume(play_volume);    // 设置为50%音量
+
     // 设置初始URL
-    // change_stream_url("http://media-ice.musicradio.com:80/ClassicFMMP3");
+    update_current_url("http://media-ice.musicradio.com:80/ClassicFMMP3");
 
     // 等待WiFi连接
     vTaskDelay(pdMS_TO_TICKS(5000));
 
     // 创建任务
-    // xTaskCreatePinnedToCore(http_stream_task, "http_stream", 8192 , NULL, 5, NULL, 0);
     xTaskCreatePinnedToCore(stream_task, "stream_task", 8192, NULL, 5, NULL, 0);
     xTaskCreatePinnedToCore(decode_play_task, "decode_task", 8192 * 4, NULL, 4, NULL, 1);
     xTaskCreatePinnedToCore(stream_cmd_task, "stream_cmd_task", 4096, NULL, 2, NULL, 0);
