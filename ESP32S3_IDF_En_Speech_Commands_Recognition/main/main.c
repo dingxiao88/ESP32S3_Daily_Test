@@ -5,6 +5,10 @@
    software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
    CONDITIONS OF ANY KIND, either express or implied.
 */
+#define DX_Audio_USE_ES8388_Export 0   //@-20241202-DX-ES8388驱动使用自己编写的
+#define DX_APP_English             0   //@-20241203-DX-使用English语音识别模型
+#define DX_Audio_USE_MAX98357      1
+
 #include <stdio.h>
 #include <stdlib.h>
 #include "freertos/FreeRTOS.h"
@@ -17,12 +21,49 @@
 #include "esp_mn_iface.h"
 #include "esp_mn_models.h"
 #include "esp_board_init.h"
+#if !(DX_Audio_USE_ES8388_Export)
 // #include "speech_commands_action.h"
+#endif
 #include "model_path.h"
 #include "esp_process_sdkconfig.h"
 
 #include "driver/gpio.h"
 
+
+#if DX_Audio_USE_MAX98357
+#include "nvs_flash.h"
+#include <math.h>
+#include "driver/i2s_std.h"
+#include "esp_log.h"
+#include "esp_spiffs.h"
+
+#define MINIMP3_IMPLEMENTATION
+#include "minimp3.h"
+
+// #include "wake_up_prompt_tone.h"
+// #include "me_turn_on_my_soundbox.h"
+#include "dx1.h"
+
+static const char *TAG = "DX_MP3_PLAYER";
+
+// I2S引脚定义
+#define I2S_Audio_BCK_IO      GPIO_NUM_16 
+#define I2S_Audio_WS_IO       GPIO_NUM_17
+#define I2S_Audio_DO_IO       GPIO_NUM_18
+#define I2S_Audio_SD_MODE     GPIO_NUM_3
+
+#define SAMPLE_RATE     16000//44100
+#define SAMPLE_BITS     16
+
+// 生成正弦波的参数
+#define SAMPLE_PER_CYCLE (SAMPLE_RATE/440)  // 440Hz音频
+#define SINE_AMPLITUDE   (32767)            // 16位有符号整数的最大值
+
+static i2s_chan_handle_t dx_max98357_i2s_handle;
+
+#endif
+
+#if DX_Audio_USE_ES8388_Export
 #include "driver/i2s_std.h"
 #include "driver/i2s_tdm.h"
 
@@ -35,6 +76,7 @@
 #include "me_play_news_channel.h"
 #include "me_turn_on_my_soundbox.h"
 #include "me_turn_off_my_soundbox.h"
+
 #include "wake_up_prompt_tone.h"
 
 // ES8388 配置
@@ -43,6 +85,7 @@
 #define I2S_WS_GPIO       GPIO_NUM_9
 #define I2S_DO_GPIO       GPIO_NUM_10
 #define I2S_DI_GPIO       GPIO_NUM_14
+#endif
 
 
 
@@ -52,7 +95,7 @@ static volatile int task_flag = 0;
 srmodel_list_t *models = NULL;
 static int play_voice = -2;
 
-
+#if DX_Audio_USE_ES8388_Export
 typedef struct {
     char* name;
     const uint16_t* data;
@@ -60,7 +103,6 @@ typedef struct {
 } dac_audio_item_t;
 
 dac_audio_item_t playlist[] = {
-    // {"ie_kaiji.h", (uint16_t*)ie_kaiji, sizeof(ie_kaiji)},
     {"wake_up_prompt_tone", (uint16_t*)wake_up_prompt_tone, sizeof(wake_up_prompt_tone)},
     {"me_tell_me_a_joke", (uint16_t*)me_tell_me_a_joke, sizeof(me_tell_me_a_joke)},
     {"me_sing_a_song", (uint16_t*)me_sing_a_song, sizeof(me_sing_a_song)},
@@ -73,6 +115,7 @@ dac_audio_item_t playlist[] = {
 i2c_obj_t i2c0_master;
 // I2S 通道句柄
 static i2s_chan_handle_t i2s_handle = NULL;
+
 
 void dx_wake_up_action(void)
 {
@@ -88,9 +131,17 @@ void dx_wake_up_action(void)
 
     printf("I2S write success\n");
 }
+#endif
 
 void play_music(void *arg)
 {
+    // 分配音频缓冲区
+    const int buf_samples = 1024;  // 每次处理的样本数
+    int16_t *samples = malloc(buf_samples * sizeof(int16_t));
+    size_t bytes_written = 0;
+    esp_err_t ret;
+
+
     while (task_flag) {
         switch (play_voice) {
         case -2:
@@ -98,13 +149,70 @@ void play_music(void *arg)
             break;
         case -1:
             printf("------------------dx wake_up_action------------------\n");
-            // wake_up_action();
+            
+            #if DX_Audio_USE_ES8388_Export
             dx_wake_up_action();
+            #elif !(DX_Audio_USE_ES8388_Export)
+                #if DX_Audio_USE_MAX98357
+
+                // 生成正弦波
+                // generate_sine_wave(samples, buf_samples);
+
+                // 写入I2S
+                // ret = i2s_channel_write(dx_max98357_i2s_handle, samples, 
+                //                                 buf_samples * sizeof(int16_t), 
+                //                                 &bytes_written, 
+                //                                 portMAX_DELAY);
+
+                // wake_up_action();
+                // (uint16_t*)me_turn_on_my_soundbox, sizeof(me_turn_on_my_soundbox)
+
+                ret = i2s_channel_write(dx_max98357_i2s_handle, dx_data, 
+                                                sizeof(dx_data), 
+                                                &bytes_written, 
+                                                portMAX_DELAY);
+                
+
+                if (ret != ESP_OK) {
+                ESP_LOGE(TAG, "i2s write failed: %d", ret);
+                } else {
+                ESP_LOGI(TAG, "Written %d bytes", bytes_written);
+                }
+                #elif !(DX_Audio_USE_MAX98357)
+                    wake_up_action();
+                #endif
+            #endif
             play_voice = -2;
             break;
         default:
             printf("------------------dx speech_commands_action------------------\n");
-            // speech_commands_action(play_voice);
+            #if !(DX_Audio_USE_ES8388_Export)
+                #if DX_Audio_USE_MAX98357
+
+
+                // // 生成正弦波
+                // generate_sine_wave(samples, buf_samples);
+                
+                // // 写入I2S
+                // ret = i2s_channel_write(dx_max98357_i2s_handle, samples, 
+                //                                 buf_samples * sizeof(int16_t), 
+                //                                 &bytes_written, 
+                //                                 portMAX_DELAY);
+
+
+                ret = i2s_channel_write(dx_max98357_i2s_handle, dx_data1, 
+                                                sizeof(dx_data1), 
+                                                &bytes_written, 
+                                                portMAX_DELAY);
+
+                                                
+
+
+                #elif !(DX_Audio_USE_MAX98357)
+                speech_commands_action(play_voice);
+                #endif
+            // speech_commands_action(0);
+            #endif
             play_voice = -2;
             break;
         }
@@ -225,7 +333,11 @@ void detect_Task(void *arg)
 {
     esp_afe_sr_data_t *afe_data = arg;
     int afe_chunksize = afe_handle->get_fetch_chunksize(afe_data);
+    #if DX_APP_English
     char *mn_name = esp_srmodel_filter(models, ESP_MN_PREFIX, ESP_MN_ENGLISH);
+    #elif !(DX_APP_English)
+    char *mn_name = esp_srmodel_filter(models, ESP_MN_PREFIX, ESP_MN_CHINESE);
+    #endif
     printf("multinet:%s\n", mn_name);
     esp_mn_iface_t *multinet = esp_mn_handle_from_name(mn_name);
     model_iface_data_t *model_data = multinet->create(mn_name, 6000);
@@ -285,12 +397,16 @@ void detect_Task(void *arg)
                 {
                     switch(mn_result->command_id[0])
                     {
-                        case 0: 
+                        // case 0: 
+                        case 20: 
                                 detect_flag = 2;
+                                play_voice = 1;
                                 gpio_set_level(GPIO_NUM_1, 0);
                                 break;
-                        case 1: 
+                        // case 1: 
+                        case 21: 
                                 detect_flag = 2;
+                                play_voice = 2;
                                 gpio_set_level(GPIO_NUM_1, 1);
                                 break;
                         default:break;
@@ -319,124 +435,7 @@ void detect_Task(void *arg)
     vTaskDelete(NULL);
 }
 
-#if 0
-/**
- * @brief       读取XL9555的16位IO值
- * @param       data：读取数据的存储区
- * @param       len：读取数据的大小
- * @retval      ESP_OK：读取成功；其他：读取失败
- */
-esp_err_t xl9555_read_byte(uint8_t *data, size_t len)
-{
-    uint8_t memaddr_buf[1];
-    memaddr_buf[0]  = XL9555_INPUT_PORT0_REG;
-
-    i2c_buf_t bufs[2] = {
-        {.len = 1, .buf = memaddr_buf},
-        {.len = len, .buf = data},
-    };
-
-    return i2c_transfer(&xl9555_i2c_master, XL9555_ADDR, 2, bufs, I2C_FLAG_WRITE | I2C_FLAG_READ | I2C_FLAG_STOP);
-}
-
-/**
- * @brief       向XL9555写入16位IO值
- * @param       reg：寄存器地址
- * @param       data：要写入的数据
- * @param       len：要写入数据的大小
- * @retval      ESP_OK：读取成功；其他：读取失败
- */
-esp_err_t xl9555_write_byte(uint8_t reg, uint8_t *data, size_t len)
-{
-    i2c_buf_t bufs[2] = {
-        {.len = 1, .buf = &reg},
-        {.len = len, .buf = data},
-    };
-
-    return i2c_transfer(&xl9555_i2c_master, XL9555_ADDR, 2, bufs, I2C_FLAG_STOP);
-}
-
-
-/**
- * @brief       控制某个IO的电平
- * @param       pin     : 控制的IO
- * @param       val     : 电平
- * @retval      返回所有IO状态
- */
-uint16_t xl9555_pin_write(uint16_t pin, int val)
-{
-    uint8_t w_data[2];
-    uint16_t temp = 0x0000;
-
-    xl9555_read_byte(w_data, 2);
-
-    if (pin <= GBC_KEY_IO)
-    {
-        if (val)
-        {
-            w_data[0] |= (uint8_t)(0xFF & pin);
-        }
-        else
-        {
-            w_data[0] &= ~(uint8_t)(0xFF & pin);
-        }
-    }
-    else
-    {
-        if (val)
-        {
-            w_data[1] |= (uint8_t)(0xFF & (pin >> 8));
-        }
-        else
-        {
-            w_data[1] &= ~(uint8_t)(0xFF & (pin >> 8));
-        }
-    }
-
-    temp = ((uint16_t)w_data[1] << 8) | w_data[0]; 
-
-    xl9555_write_byte(XL9555_OUTPUT_PORT0_REG, w_data, 2);
-
-    return temp;
-}
-
-
-/**
- * @brief       初始化XL9555
- * @param       无
- * @retval      无
- */
-void xl9555_init(i2c_obj_t self)
-{
-    uint8_t r_data[2];
-
-    if (self.init_flag == ESP_FAIL)
-    {
-        iic_init(I2C_NUM_0);        /* 初始化IIC */
-    }
-
-    xl9555_i2c_master = self;
-    gpio_config_t gpio_init_struct = {0};
-    
-    gpio_init_struct.intr_type = GPIO_INTR_DISABLE;
-    gpio_init_struct.mode = GPIO_MODE_INPUT;
-    gpio_init_struct.pin_bit_mask = (1ull << XL9555_INT_IO);
-    gpio_init_struct.pull_down_en = GPIO_PULLDOWN_DISABLE;
-    gpio_init_struct.pull_up_en = GPIO_PULLUP_ENABLE;
-    gpio_config(&gpio_init_struct);     /* 配置XL_INT引脚 */
-
-    /* 上电先读取一次清除中断标志 */
-    xl9555_read_byte(r_data, 2);
-    
-    xl9555_ioconfig(0xF003);
-    xl9555_pin_write(BEEP_IO, 1);
-    xl9555_pin_write(SPK_EN_IO, 1);
-}
-#endif
-
-
-
-
+#if DX_Audio_USE_ES8388_Export
 esp_err_t audio_init(void)
 {
     // I2S 通道配置
@@ -444,7 +443,7 @@ esp_err_t audio_init(void)
         .id = I2S_NUM_0,
         .role = I2S_ROLE_MASTER,
         .dma_desc_num = 8,
-        .dma_frame_num = 256,
+        .dma_frame_num = 512,
         .auto_clear = true,
     };
     
@@ -457,7 +456,7 @@ esp_err_t audio_init(void)
         },
         .slot_cfg = {
             .data_bit_width = I2S_DATA_BIT_WIDTH_16BIT,
-            .slot_bit_width = I2S_SLOT_BIT_WIDTH_16BIT,
+            .slot_bit_width = I2S_SLOT_BIT_WIDTH_AUTO,//I2S_SLOT_BIT_WIDTH_16BIT,
             .slot_mode = I2S_SLOT_MODE_STEREO,
             .slot_mask = I2S_STD_SLOT_BOTH,
             .ws_width = 16, 
@@ -467,6 +466,7 @@ esp_err_t audio_init(void)
             .big_endian = false,
             .bit_order_lsb = false,
         },
+        
         .gpio_cfg = {
             .mclk = I2S_MCLK_GPIO,
             .bclk = I2S_BCLK_GPIO,
@@ -512,27 +512,168 @@ void generate_sine_wave(void *arg)
     //     buffer[i * 2] = sample;     // 左声道
     //     buffer[i * 2 + 1] = sample; // 右声道
     // }
+
+
+    // // 循环发送
+    // while (1) 
+    // {
+    //     size_t bytes_written = 0;
+    //     // i2s_channel_write(i2s_handle, buffer, sizeof(buffer), 
+    //     //                  &bytes_written, portMAX_DELAY);
+    //     esp_err_t ret = i2s_channel_write(i2s_handle, (int16_t *)(playlist[0].data), playlist[0].length,&bytes_written, portMAX_DELAY);
+         
+    //     if (ret != ESP_OK) 
+    //     {
+    //     // ESP_LOGE(TAG, "I2S write failed: %d", ret);
+    //     printf("I2S write failed: %d\n", ret);
+    //     }
+
+    //     // 可选：添加延时
+    //     vTaskDelay(pdMS_TO_TICKS(1));
+    // }
+
+
+    int bytes_written = 0;
+    // int16_t *write_ptr = (int16_t *)(playlist[3].data);
+    uint16_t *write_ptr = (uint16_t *)(playlist[0].data);
+    int remaining = (playlist[0].length);
+    printf("Total to write %d bytes\n", remaining);
     
     // 循环发送
-    while (1) {
-        size_t bytes_written = 0;
-        // i2s_channel_write(i2s_handle, buffer, sizeof(buffer), 
-        //                  &bytes_written, portMAX_DELAY);
-        esp_err_t ret = i2s_channel_write(i2s_handle, (int16_t *)(playlist[0].data), playlist[0].length,&bytes_written, portMAX_DELAY);
+    while (remaining > 0) 
+    {
+        // 调用具体编解码器的写函数
+        int ret = i2s_channel_write(i2s_handle, write_ptr, remaining ,&bytes_written, portMAX_DELAY);
+
+        // printf("ret: %d\n", ret);
+        printf("Successfully wrote %d bytes\n", bytes_written);
          
-        if (ret != ESP_OK) 
-        {
-        // ESP_LOGE(TAG, "I2S write failed: %d", ret);
-        printf("I2S write failed: %d\n", ret);
+        // 检查写入结果
+        if (ret < 0) {
+            // 发生错误
+            if (bytes_written == 0) {
+                return ret;  // 如果没有写入任何数据，返回错误码
+            }
+            break;  // 如果已写入部分数据，返回已写入的数量
         }
 
-        // 可选：添加延时
-        vTaskDelay(pdMS_TO_TICKS(1));
+        if (ret == 0) {
+            // 设备缓冲区已满，等待一段时间
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
+        // 更新计数器和指针
+        bytes_written += ret;
+        write_ptr += ret;
+        remaining -= ret;
     }
+}
+#endif
+
+#if DX_Audio_USE_MAX98357
+// 生成正弦波数据
+void generate_sine_wave(int16_t* samples, int count)
+{
+    static float phase = 0.0f;
+    for (int i = 0; i < count; i += 2) {
+        float sine_val = sinf(phase);
+        int16_t sample = (int16_t)(sine_val * SINE_AMPLITUDE);
+        samples[i] = sample;        // 左声道
+        samples[i + 1] = sample;    // 右声道
+        
+        phase += 2 * M_PI / SAMPLE_PER_CYCLE;
+        if (phase >= 2 * M_PI) {
+            phase -= 2 * M_PI;
+        }
+    }
+}
+// 初始化I2S
+static esp_err_t i2s_init(void)
+{
+    #if 1
+    // 1. 配置I2S通道
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    chan_cfg.auto_clear = true;
+    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &dx_max98357_i2s_handle, NULL));
+
+    // 2. 配置I2S标准模式
+    i2s_std_config_t std_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = I2S_Audio_BCK_IO,
+            .ws = I2S_Audio_WS_IO,
+            .dout = I2S_Audio_DO_IO,
+            .din = I2S_GPIO_UNUSED,
+            .invert_flags = {
+                .mclk_inv = false,
+                .bclk_inv = false,
+                .ws_inv = false,
+            },
+        },
+    };
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(dx_max98357_i2s_handle, &std_cfg));
+    ESP_ERROR_CHECK(i2s_channel_enable(dx_max98357_i2s_handle));
+    #endif
+
+    // 3. 配置MAX98357的SD模式引脚
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << I2S_Audio_SD_MODE),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_conf);
+    gpio_set_level(I2S_Audio_SD_MODE, 1);  // 使能MAX98357输出
+
+    return ESP_OK;
+}
+#endif
+
+// 初始化SPIFFS
+static esp_err_t init_spiffs(void)
+{
+    ESP_LOGI(TAG, "Initializing SPIFFS");
+
+    esp_vfs_spiffs_conf_t conf = {
+        .base_path = "/spiffs",
+        .partition_label = NULL,
+        .max_files = 5,
+        .format_if_mount_failed = true
+    };
+
+    esp_err_t ret = esp_vfs_spiffs_register(&conf);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to mount SPIFFS (%s)", esp_err_to_name(ret));
+        return ret;
+    }
+
+    size_t total = 0, used = 0;
+    ret = esp_spiffs_info(NULL, &total, &used);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to get SPIFFS partition info (%s)", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ESP_LOGI(TAG, "Partition size: total: %d, used: %d", total, used);
+    return ESP_OK;
 }
 
 void app_main()
 {
+    // esp_err_t ret;
+    // /* 初始化NVS */
+    // ret = nvs_flash_init();                             
+    // if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    // {
+    //     ESP_ERROR_CHECK(nvs_flash_erase());
+    //     ret = nvs_flash_init();
+    // }
+
+    //@-加载模型
     models = esp_srmodel_init("model"); // partition label defined in partitions.csv
 
     printf("ESP_ERROR_CHECK--->start\n");
@@ -551,6 +692,15 @@ void app_main()
     gpio_config(&gpio_init_struct); /* 配置 GPIO */
     gpio_set_level(GPIO_NUM_1, 1);
 
+    #if DX_Audio_USE_MAX98357
+    // init_spiffs();
+    // 初始化I2S
+    ESP_ERROR_CHECK(i2s_init());
+    ESP_LOGI(TAG, "I2S initialized successfully");
+    #endif
+
+
+    #if DX_Audio_USE_ES8388_Export
     //@-初始化ES8388
     i2c0_master = iic_init(I2C_NUM_0);
     xl9555_init(i2c0_master);
@@ -565,13 +715,13 @@ void app_main()
 
     xl9555_pin_write(SPK_EN_IO,0);
 
-    // xl9555_pin_write(SPK_EN_IO,0);                      /* ������ */
     audio_init();
 
     // generate_sine_wave();
     vTaskDelay(200);
     //@-测试I2S配置是否正确-audio
     // xTaskCreatePinnedToCore(&generate_sine_wave, "generate_sine_wave", 8 * 1024, NULL, 5, NULL, 1);
+    #endif
 
 #if 1
 #if CONFIG_IDF_TARGET_ESP32
@@ -591,6 +741,10 @@ void app_main()
     afe_config.se_init = false;
 #endif
     esp_afe_sr_data_t *afe_data = afe_handle->create_from_config(&afe_config);
+
+    // vTaskDelay(pdMS_TO_TICKS(1000));
+    // init_spiffs();
+    // vTaskDelay(pdMS_TO_TICKS(1000));
 
     task_flag = 1;
     xTaskCreatePinnedToCore(&detect_Task, "detect", 8 * 1024, (void*)afe_data, 5, NULL, 1);

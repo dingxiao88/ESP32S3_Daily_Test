@@ -1,0 +1,1 @@
+idf添加新库的方法参考视频：https://www.bilibili.com/video/BV1jm421H7MH/?spm_id_from=333.337.search-card.all.click&vd_source=7afd4a378724dff475b92f19b784e0ee
